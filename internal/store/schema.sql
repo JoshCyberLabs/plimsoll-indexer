@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS reserve_reports (
 CREATE INDEX IF NOT EXISTS reserve_reports_sac_tier_asof
     ON reserve_reports (sac, tier, as_of DESC);
 ALTER TABLE reserve_reports ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'event';
+-- null = not yet checked; 'match', 'mismatch', or 'unreachable'.
+ALTER TABLE reserve_reports ADD COLUMN IF NOT EXISTS doc_check TEXT;
 
 CREATE TABLE IF NOT EXISTS reporters (
     address         TEXT PRIMARY KEY,

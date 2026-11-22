@@ -251,7 +251,8 @@ func (s *Store) LatestSupply(ctx context.Context, sac string) (*coverage.Supply,
 
 func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error) {
 	return s.queryReports(ctx, `
-		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source
+		SELECT tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+		       COALESCE(doc_check, '')
 		FROM reserve_reports WHERE sac = $1
 		ORDER BY posted_ledger DESC, as_of DESC LIMIT $2`, sac, limit)
 }
@@ -259,7 +260,8 @@ func (s *Store) ReportHistory(ctx context.Context, sac string, limit int) ([]cov
 // LatestReports returns the newest report (by as_of) for each tier.
 func (s *Store) LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error) {
 	list, err := s.queryReports(ctx, `
-		SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source
+		SELECT DISTINCT ON (tier) tier, amount::text, as_of, posted_at, reporter, doc_hash, doc_uri, tx_hash, source,
+		                           COALESCE(doc_check, '')
 		FROM reserve_reports WHERE sac = $1
 		ORDER BY tier, as_of DESC`, sac)
 	if err != nil {
@@ -283,7 +285,7 @@ func (s *Store) queryReports(ctx context.Context, sql string, args ...any) ([]co
 		var r coverage.Report
 		var tier int16
 		var amount string
-		if err := rows.Scan(&tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash, &r.Source); err != nil {
+		if err := rows.Scan(&tier, &amount, &r.AsOf, &r.PostedAt, &r.Reporter, &r.DocHash, &r.DocURI, &r.TxHash, &r.Source, &r.DocCheck); err != nil {
 			return nil, err
 		}
 		r.Tier = uint32(tier)
@@ -434,4 +436,116 @@ func chainSupplyID(sac string, ledger uint32) string {
 
 func chainReportID(sac string, tier uint32, asOf time.Time) string {
 	return fmt.Sprintf("chain:%s:report:%d:%d", sac, tier, asOf.Unix())
+}
+
+// ---- reporter reconciliation -----------------------------------------------
+
+// AllReporterAddresses returns every reporter address in the reporters table,
+// active or inactive, so the reconciler can check each one against the chain.
+func (s *Store) AllReporterAddresses(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT address FROM reporters ORDER BY address`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		out = append(out, addr)
+	}
+	return out, rows.Err()
+}
+
+// ReportReporterAddresses returns the reporter addresses that appear in
+// reserve_reports but not in the reporters table. These are reporters whose
+// reporter_set event was missed during an ingestion gap.
+func (s *Store) ReportReporterAddresses(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT reporter FROM reserve_reports
+		WHERE reporter NOT IN (SELECT address FROM reporters)
+		ORDER BY reporter`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		out = append(out, addr)
+	}
+	return out, rows.Err()
+}
+
+// SaveChainReporter upserts a reporter read back from the registry contract.
+// It returns true when the row was new or changed (role, name, or active status).
+// updated_ledger is set to 0 because the reconciler reads current state without
+// knowing which specific ledger set it.
+func (s *Store) SaveChainReporter(ctx context.Context, r coverage.Reporter) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO reporters (address, role, name, active, updated_ledger, updated_at)
+		VALUES ($1, $2, $3, true, 0, now())
+		ON CONFLICT (address) DO UPDATE
+		SET role = EXCLUDED.role, name = EXCLUDED.name, active = true,
+		    updated_at = now()
+		WHERE reporters.active = false
+		   OR reporters.role <> EXCLUDED.role
+		   OR reporters.name <> EXCLUDED.name`,
+		r.Address, int16(r.Role), r.Name)
+	if err != nil {
+		return false, fmt.Errorf("save chain reporter: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// MarkReporterInactive marks a reporter as revoked. Returns true when the
+// row existed and was changed (i.e., the reporter was previously active).
+func (s *Store) MarkReporterInactive(ctx context.Context, address string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE reporters SET active = false, updated_at = now()
+		WHERE address = $1 AND active = true`,
+		address)
+	if err != nil {
+		return false, fmt.Errorf("mark reporter inactive: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// ---- doc hash checker -------------------------------------------------------
+
+// ListPendingDocChecks returns reports that have a doc_uri but have not yet
+// been verified, up to limit rows.
+func (s *Store) ListPendingDocChecks(ctx context.Context, limit int) ([]coverage.DocCheckTask, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT event_id, doc_uri, doc_hash FROM reserve_reports
+		WHERE doc_check IS NULL AND doc_uri != ''
+		ORDER BY posted_ledger DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []coverage.DocCheckTask
+	for rows.Next() {
+		var t coverage.DocCheckTask
+		if err := rows.Scan(&t.EventID, &t.DocURI, &t.DocHash); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// SaveDocCheck records the result of a document hash verification. result must
+// be one of "match", "mismatch", or "unreachable".
+func (s *Store) SaveDocCheck(ctx context.Context, eventID, result string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE reserve_reports SET doc_check = $2 WHERE event_id = $1`,
+		eventID, result)
+	return err
 }

@@ -7,6 +7,34 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
+// ReporterState is the registry contract's current entry for one reporter, as
+// get_reporter returns it.
+type ReporterState struct {
+	Role uint32
+	Name string
+}
+
+// DecodeReporterState reads what get_reporter returns. A reporter that has
+// never been registered, or was revoked, decodes to (nil, nil).
+func DecodeReporterState(v xdr.ScVal) (*ReporterState, error) {
+	if v.Type == xdr.ScValTypeScvVoid {
+		return nil, nil
+	}
+	f, err := Fields(v)
+	if err != nil {
+		return nil, err
+	}
+	role, err := AsU32(f["role"])
+	if err != nil {
+		return nil, err
+	}
+	name, err := AsString(f["name"])
+	if err != nil {
+		return nil, err
+	}
+	return &ReporterState{Role: role, Name: name}, nil
+}
+
 // SupplyState is the coverage ledger's current snapshot for one asset, as
 // get_supply returns it.
 type SupplyState struct {

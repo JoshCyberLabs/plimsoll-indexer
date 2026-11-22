@@ -83,6 +83,17 @@ type Report struct {
 	DocURI   string    `json:"doc_uri"`
 	TxHash   string    `json:"tx_hash"`
 	Source   string    `json:"source"`
+	// DocCheck is the result of the last document hash verification:
+	// "match", "mismatch", "unreachable", or empty when not yet checked.
+	DocCheck string `json:"doc_check,omitempty"`
+}
+
+// DocCheckTask is the minimum data the doc checker needs to verify one reserve
+// report without loading the full report.
+type DocCheckTask struct {
+	EventID string
+	DocURI  string
+	DocHash string
 }
 
 type Reporter struct {

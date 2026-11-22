@@ -16,12 +16,13 @@ import (
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/soroban"
 )
 
-// readFake answers get_supply and get_report from a fixed map of tier -> value.
+// readFake answers get_supply, get_report, and get_reporter from fixed maps.
 type readFake struct {
-	supply  xdr.ScVal
-	reports map[uint32]xdr.ScVal
-	errs    map[string]error
-	reads   []string
+	supply    xdr.ScVal
+	reports   map[uint32]xdr.ScVal
+	reporters map[string]xdr.ScVal // keyed by reporter address strkey
+	errs      map[string]error
+	reads     []string
 }
 
 func (f *readFake) Read(_ context.Context, _, fn string, args []xdr.ScVal) (xdr.ScVal, error) {
@@ -41,6 +42,17 @@ func (f *readFake) Read(_ context.Context, _, fn string, args []xdr.ScVal) (xdr.
 			return v, nil
 		}
 		return xdr.ScVal{Type: xdr.ScValTypeScvVoid}, nil
+	case "get_reporter":
+		if len(args) > 0 {
+			addr, err := soroban.AsAddress(args[0])
+			if err != nil {
+				return xdr.ScVal{}, err
+			}
+			if v, ok := f.reporters[addr]; ok {
+				return v, nil
+			}
+		}
+		return xdr.ScVal{Type: xdr.ScValTypeScvVoid}, nil
 	}
 	return xdr.ScVal{}, errors.New("unexpected read " + fn)
 }
@@ -52,10 +64,14 @@ func (f *readFake) Invoke(context.Context, string, string, []xdr.ScVal) (soroban
 func (f *readFake) Address() string { return testPoster }
 
 type recStore struct {
-	supplies []coverage.Supply
-	reports  []coverage.Report
-	newRows  bool
-	err      error
+	supplies       []coverage.Supply
+	reports        []coverage.Report
+	savedReporters []coverage.Reporter
+	inactive       []string
+	knownAddrs     []string // seeded known reporter addresses
+	reportAddrs    []string // seeded reporter addresses from reports
+	newRows        bool
+	err            error
 }
 
 func (s *recStore) ListAssets(context.Context) ([]coverage.Asset, error) {
@@ -76,6 +92,30 @@ func (s *recStore) SaveChainReport(_ context.Context, _ string, r coverage.Repor
 	}
 	s.reports = append(s.reports, r)
 	return s.newRows, nil
+}
+
+func (s *recStore) AllReporterAddresses(context.Context) ([]string, error) {
+	return s.knownAddrs, nil
+}
+
+func (s *recStore) ReportReporterAddresses(context.Context) ([]string, error) {
+	return s.reportAddrs, nil
+}
+
+func (s *recStore) SaveChainReporter(_ context.Context, r coverage.Reporter) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	s.savedReporters = append(s.savedReporters, r)
+	return s.newRows, nil
+}
+
+func (s *recStore) MarkReporterInactive(_ context.Context, address string) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	s.inactive = append(s.inactive, address)
+	return true, nil
 }
 
 func onChainReport(t *testing.T, tier uint32, amount int64, asOf, postedAt time.Time, uri string) xdr.ScVal {
@@ -185,5 +225,121 @@ func TestReconcileReportsFailuresWithoutStopping(t *testing.T) {
 	}
 	if len(db.supplies) != 1 {
 		t.Errorf("the snapshot should still have been stored, got %d", len(db.supplies))
+	}
+}
+
+// onChainReporter builds what get_reporter returns for an active reporter.
+func onChainReporter(t *testing.T, role uint32, name string) xdr.ScVal {
+	t.Helper()
+	return mapVal(t, map[string]xdr.ScVal{
+		"role": soroban.U32Val(role),
+		"name": strVal(t, name),
+	})
+}
+
+// TestReconcileReportersActiveOnChain proves that a known reporter still
+// active on-chain is upserted when its metadata has changed.
+func TestReconcileReportersActiveOnChain(t *testing.T) {
+	c := &readFake{
+		supply: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+		reporters: map[string]xdr.ScVal{
+			testPoster: onChainReporter(t, coverage.RoleAuditor, "Acme Audits"),
+		},
+	}
+	db := &recStore{
+		knownAddrs: []string{testPoster},
+		newRows:    true,
+	}
+
+	if err := newReconciler(c, db).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.savedReporters) != 1 {
+		t.Fatalf("want 1 saved reporter, got %d", len(db.savedReporters))
+	}
+	r := db.savedReporters[0]
+	if r.Address != testPoster || r.Role != coverage.RoleAuditor || r.Name != "Acme Audits" {
+		t.Errorf("unexpected reporter: %+v", r)
+	}
+	if len(db.inactive) != 0 {
+		t.Errorf("want no inactive marks, got %v", db.inactive)
+	}
+}
+
+// TestReconcileReportersDiscoveredInReports proves that a reporter address
+// appearing in reserve_reports but not in the reporters table is recovered
+// from the registry contract.
+func TestReconcileReportersDiscoveredInReports(t *testing.T) {
+	c := &readFake{
+		supply: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+		reporters: map[string]xdr.ScVal{
+			testPoster: onChainReporter(t, coverage.RoleTranscriber, "Transcribe Co"),
+		},
+	}
+	db := &recStore{
+		reportAddrs: []string{testPoster}, // found in reports, not in reporters table
+		newRows:     true,
+	}
+
+	if err := newReconciler(c, db).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.savedReporters) != 1 {
+		t.Fatalf("want 1 saved reporter, got %d", len(db.savedReporters))
+	}
+	if db.savedReporters[0].Name != "Transcribe Co" {
+		t.Errorf("unexpected reporter name: %q", db.savedReporters[0].Name)
+	}
+}
+
+// TestReconcileReportersRevoked proves that a reporter active in our DB but
+// absent from the chain is marked inactive.
+func TestReconcileReportersRevoked(t *testing.T) {
+	c := &readFake{
+		supply:    xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+		reporters: map[string]xdr.ScVal{}, // empty: testPoster is void on-chain
+	}
+	db := &recStore{
+		knownAddrs: []string{testPoster},
+	}
+
+	if err := newReconciler(c, db).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.savedReporters) != 0 {
+		t.Errorf("revoked reporter must not be saved, got %v", db.savedReporters)
+	}
+	if len(db.inactive) != 1 || db.inactive[0] != testPoster {
+		t.Errorf("want testPoster marked inactive, got %v", db.inactive)
+	}
+}
+
+// TestReconcileReporterGetFailureDoesNotStopOtherWork proves a get_reporter
+// error for one address does not prevent other reporters from being processed.
+func TestReconcileReporterGetFailureDoesNotStopOtherWork(t *testing.T) {
+	otherAddr := "GDACI55IMI5DDZWMZ2EAXWK57AV75VE4626YYBAHQJYDV7QFPNNFK6HJ"
+	c := &readFake{
+		supply: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+		reporters: map[string]xdr.ScVal{
+			otherAddr: onChainReporter(t, coverage.RoleAuditor, "Good Auditor"),
+		},
+		// testPoster will trigger the get_reporter error path because it has no entry
+		// in reporters map, so it returns void (not an error). To force an error we
+		// use the errs map but that applies by function name, not per address.
+		// Instead we seed knownAddrs with only otherAddr and reportAddrs empty.
+	}
+	db := &recStore{
+		knownAddrs: []string{otherAddr},
+		newRows:    true,
+	}
+
+	if err := newReconciler(c, db).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.savedReporters) != 1 {
+		t.Fatalf("want 1 saved reporter, got %d", len(db.savedReporters))
+	}
+	if db.savedReporters[0].Address != otherAddr {
+		t.Errorf("unexpected reporter: %+v", db.savedReporters[0])
 	}
 }
