@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - staticcheck
+    - govet
+    - ineffassign
+    - unused
+    - gosec
+    - bodyclose
+
+  exclusions:
+    rules:
+      # Close/Rollback/Flush errors are routinely ignored by convention.
+      - linters: [errcheck]
+        text: '\.(Close|Rollback|Flush)\b'
+      # fmt.Fprint* writes to an io.Writer: errors are safely ignored in CLI output.
+      - linters: [errcheck]
+        text: '`fmt\.F'
+      # G107: variable URL is validated (HTTPS-only + private-IP dialer) in doccheck.go.
+      - path: worker/doccheck\.go
+        linters: [gosec]
+        text: G107
+      # G104: unhandled error in deferred Body.Close is acceptable.
+      - linters: [gosec]
+        text: 'G104'
+      # G115: integer narrowing casts between uint32/int16/int64 are intentional
+      # throughout for PostgreSQL column types and XDR wire values.
+      - linters: [gosec]
+        text: 'G115'
+      # G705: XSS taint false positive on internal HTTP handler writes.
+      - linters: [gosec]
+        text: 'G705'
+      # Test files: suppress deprecated-API warnings and naming-convention nits.
+      - path: _test\.go
+        linters: [gosec, errcheck, staticcheck]
+
+run:
+  timeout: 5m

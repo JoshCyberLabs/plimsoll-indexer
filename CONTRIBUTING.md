@@ -32,7 +32,7 @@ the ingest loop, not decoding of contract events.
 ## Pull request checklist
 
 - [ ] One change per pull request, linked to its issue.
-- [ ] `gofmt -l .` prints nothing; `go vet ./...` and `go test ./...` pass.
+- [ ] `gofmt -l .` prints nothing; `go vet ./...`, `go test ./...`, and `golangci-lint run` pass.
 - [ ] New behaviour has tests. HTTP and Horizon interactions are tested with `httptest`.
 - [ ] Schema changes are additive and idempotent (`IF NOT EXISTS`) in `internal/store/schema.sql`.
 - [ ] Conventional Commits: `feat(api): …`, `fix(poster): …`.
