@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -33,6 +34,11 @@ type fakeRPC struct {
 	loadCalls int
 	sent      []sentTx
 	pollFail  bool
+	// sendStatuses is a scripted list of statuses for SendTransaction.
+	// Entries before the first PENDING or ERROR are TRY_AGAIN_LATER attempts.
+	// When exhausted, the remaining calls default to "PENDING".
+	sendStatuses []string
+	sendCalls    int
 }
 
 func (f *fakeRPC) LoadAccount(_ context.Context, address string) (txnbuild.Account, error) {
@@ -62,12 +68,22 @@ func (f *fakeRPC) SendTransaction(_ context.Context, req protocol.SendTransactio
 	if len(env.Signatures()) == 0 {
 		f.t.Fatal("transaction was sent unsigned")
 	}
+
+	status := "PENDING"
+	if f.sendCalls < len(f.sendStatuses) {
+		status = f.sendStatuses[f.sendCalls]
+	}
+	f.sendCalls++
+
+	if status == "TRY_AGAIN_LATER" || status == "ERROR" {
+		return protocol.SendTransactionResponse{Status: status}, nil
+	}
 	f.sent = append(f.sent, sentTx{
 		restore: ops[0].Body.Type == xdr.OperationTypeRestoreFootprint,
 		fee:     int64(env.Fee()),
 	})
 	f.seq++
-	return protocol.SendTransactionResponse{Status: "PENDING", Hash: hashFor(len(f.sent))}, nil
+	return protocol.SendTransactionResponse{Status: status, Hash: hashFor(len(f.sent))}, nil
 }
 
 func (f *fakeRPC) PollTransaction(_ context.Context, txHash string) (protocol.GetTransactionResponse, error) {
@@ -133,7 +149,12 @@ func archivedSim(t *testing.T) protocol.SimulateTransactionResponse {
 }
 
 func newInvoker(f *fakeRPC) *Invoker {
-	return &Invoker{RPC: f, Signer: keypair.MustRandom(), Passphrase: testPassphrase}
+	return &Invoker{
+		RPC:        f,
+		Signer:     keypair.MustRandom(),
+		Passphrase: testPassphrase,
+		RetryDelay: time.Millisecond, // fast for tests; real default is 10 s
+	}
 }
 
 func TestInvokeRestoresArchivedEntriesThenRetries(t *testing.T) {
@@ -345,6 +366,54 @@ func TestInvokerRefusesWhenFeeExceedsCeiling(t *testing.T) {
 	}
 	if len(f.sent) != 0 {
 		t.Error("nothing should be sent when the fee exceeds the ceiling")
+	}
+}
+
+// When RPC is congested it replies TRY_AGAIN_LATER and the invoker retries
+// with the same signed transaction until it is accepted.
+func TestInvokeRetriesOnTryAgainLater(t *testing.T) {
+	f := &fakeRPC{
+		t:            t,
+		sims:         []protocol.SimulateTransactionResponse{okSim(t)},
+		seq:          7,
+		sendStatuses: []string{"TRY_AGAIN_LATER"}, // first attempt refused; second defaults to PENDING
+	}
+	res, err := newInvoker(f).Invoke(context.Background(), cAddr, "post_supply", nil)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if f.sendCalls != 2 {
+		t.Errorf("want 2 send calls (1 TRY_AGAIN_LATER + 1 PENDING), got %d", f.sendCalls)
+	}
+	if len(f.sent) != 1 {
+		t.Fatalf("want 1 accepted transaction, got %d", len(f.sent))
+	}
+	if res.TxHash != hashFor(1) {
+		t.Errorf("result reports wrong hash %s", res.TxHash)
+	}
+}
+
+// After sendMaxRetries TRY_AGAIN_LATER responses the invoker gives up.
+func TestInvokeGivesUpAfterMaxRetriesOnTryAgainLater(t *testing.T) {
+	f := &fakeRPC{
+		t:    t,
+		sims: []protocol.SimulateTransactionResponse{okSim(t)},
+		seq:  3,
+		sendStatuses: []string{
+			"TRY_AGAIN_LATER",
+			"TRY_AGAIN_LATER",
+			"TRY_AGAIN_LATER",
+		},
+	}
+	_, err := newInvoker(f).Invoke(context.Background(), cAddr, "post_supply", nil)
+	if err == nil {
+		t.Fatal("expected an error after max retries")
+	}
+	if !strings.Contains(err.Error(), "TRY_AGAIN_LATER") {
+		t.Fatalf("error must mention TRY_AGAIN_LATER, got: %v", err)
+	}
+	if len(f.sent) != 0 {
+		t.Fatalf("no transaction should have been accepted, got %d", len(f.sent))
 	}
 }
 

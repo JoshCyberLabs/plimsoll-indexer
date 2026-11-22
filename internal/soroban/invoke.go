@@ -2,6 +2,7 @@ package soroban
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,6 +28,26 @@ type RPC interface {
 	PollTransaction(ctx context.Context, txHash string) (protocol.GetTransactionResponse, error)
 }
 
+// sendMaxRetries is the maximum number of times signSendPoll retries sending
+// a transaction that is rejected with TRY_AGAIN_LATER. The delay between
+// attempts doubles each time (10 s, 20 s), so the total extra wait before
+// giving up is at most ~30 seconds beyond the first attempt.
+const sendMaxRetries = 3
+
+// sendRetryBase is the initial delay between TRY_AGAIN_LATER retries. It
+// doubles with each attempt. Zero in an Invoker means use this default.
+const sendRetryBase = 10 * time.Second
+
+// pollTimeout is how long signSendPoll waits for a submitted transaction to
+// reach a terminal status. Stellar ledgers close every ~5 seconds; 60 seconds
+// covers twelve ledger closes with room to spare.
+const pollTimeout = 60 * time.Second
+
+// pollCheckTimeout is the brief window used to verify whether a transaction
+// landed after the main poll timed out. It is long enough for one RPC round
+// trip but short enough not to delay a worker tick.
+const pollCheckTimeout = 2 * time.Second
+
 // Invoker submits contract calls signed by a single account. The account is
 // both the transaction source and the address whose auth the contract
 // requires, so simulation returns source-account credentials and no separate
@@ -50,6 +71,11 @@ type Invoker struct {
 	// fee as headroom. For example, 20 pads sim.MinResourceFee by 20 %.
 	// Zero means no margin.
 	ResourceFeeMarginPct int64
+
+	// RetryDelay overrides sendRetryBase for TRY_AGAIN_LATER back-off.
+	// Zero means use sendRetryBase. Tests set this to a small value so the
+	// retry path runs without sleeping.
+	RetryDelay time.Duration
 }
 
 // Result of a successful invocation.
@@ -314,18 +340,50 @@ func (inv *Invoker) signSendPoll(ctx context.Context, tx *txnbuild.Transaction, 
 	if err != nil {
 		return Result{}, err
 	}
-	sent, err := inv.RPC.SendTransaction(ctx, protocol.SendTransactionRequest{Transaction: txB64})
-	if err != nil {
-		return Result{}, fmt.Errorf("send: %w", err)
+
+	retryDelay := inv.RetryDelay
+	if retryDelay == 0 {
+		retryDelay = sendRetryBase
 	}
-	if sent.Status == "ERROR" || sent.Status == "TRY_AGAIN_LATER" {
+
+	var sent protocol.SendTransactionResponse
+	for attempt := 1; ; attempt++ {
+		sent, err = inv.RPC.SendTransaction(ctx, protocol.SendTransactionRequest{Transaction: txB64})
+		if err != nil {
+			return Result{}, fmt.Errorf("send: %w", err)
+		}
+		if sent.Status != "TRY_AGAIN_LATER" {
+			break
+		}
+		if attempt >= sendMaxRetries {
+			return Result{}, fmt.Errorf("send %s: TRY_AGAIN_LATER after %d attempts", what, attempt)
+		}
+		wait := retryDelay << (attempt - 1)
+		select {
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	if sent.Status == "ERROR" {
 		return Result{}, fmt.Errorf("send %s: status %s %s", what, sent.Status, sent.ErrorResultXDR)
 	}
 
-	pollCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 	defer cancel()
 	got, err := inv.RPC.PollTransaction(pollCtx, sent.Hash)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			// The polling window closed. Check once more with a short deadline:
+			// if the transaction landed in the final moments this avoids a
+			// redundant resubmit on the next worker tick.
+			checkCtx, checkCancel := context.WithTimeout(ctx, pollCheckTimeout)
+			defer checkCancel()
+			if check, checkErr := inv.RPC.PollTransaction(checkCtx, sent.Hash); checkErr == nil &&
+				check.Status == protocol.TransactionStatusSuccess {
+				return Result{TxHash: sent.Hash, Ledger: check.Ledger}, nil
+			}
+		}
 		return Result{}, fmt.Errorf("poll %s: %w", sent.Hash, err)
 	}
 	if got.Status != protocol.TransactionStatusSuccess {
